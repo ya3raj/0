@@ -3719,7 +3719,7 @@ export function ChatScreen({
       onAuditActivity({
         outcome: outcome.stopReason === "cancelled" ? "stopped"
           : outcome.stopReason === "error" ? "failed"
-          : outcome.stopReason === "max_turn_tokens" || outcome.stopReason === "max_tool_iterations" ? "waiting"
+          : outcome.stopReason === "max_turn_tokens" || outcome.stopReason === "max_tool_iterations" || outcome.stopReason === "max_output_tokens" ? "waiting"
           : !assistantText && !outcome.assistantText && outcome.toolCalls.length === 0 ? "failed"
           : "completed",
       });
@@ -3774,6 +3774,13 @@ export function ChatScreen({
           kind: "error",
           text: `paused at the turn token budget (${used}k of ${limit}k)`,
           detail: `Ran ${outcome.budget.iterations} tool call${outcome.budget.iterations === 1 ? "" : "s"}. Send another message to continue — the conversation is kept, and nothing re-runs.`,
+          turn: currentTurn,
+        });
+      } else if (outcome.stopReason === "max_output_tokens") {
+        appendEntry({
+          kind: "error",
+          text: "paused at the provider output limit",
+          detail: "Automatic checkpoint continuations reached their safety bound. Progress is preserved; send another message to continue without re-running completed work.",
           turn: currentTurn,
         });
       } else if (outcome.stopReason === "max_tool_iterations") {

@@ -317,6 +317,7 @@ export type ConsoleStopReason =
   | "end_turn"
   | "max_tool_iterations"
   | "max_turn_tokens"
+  | "max_output_tokens"
   | "cancelled"
   | "error";
 
@@ -2896,6 +2897,11 @@ export function createConsoleSession(config: ConsoleSessionConfig): ConsoleSessi
     const usage = { inputTokens: 0, outputTokens: 0 };
     let assistantText = "";
     let iterations = 0;
+    // Bound consecutive provider-cap continuations so an unusually verbose model
+    // cannot turn one operator message into an unbounded generation chain. A
+    // successful tool round resets the counter because that is concrete progress.
+    let outputContinuations = 0;
+    const maxOutputContinuations = 3;
     const recordToolResult = (call: ToolCall, result: ToolResult, startedAt: number, findingsBefore: number): void => {
       try {
         analyticsPipeline.recordCommand({
@@ -3302,7 +3308,11 @@ export function createConsoleSession(config: ConsoleSessionConfig): ConsoleSessi
       }
 
 
-      messages.push({ role: "assistant", content: result.content });
+      messages.push({
+        role: "assistant",
+        content: result.content,
+        ...(result.providerRaw ? { providerRaw: result.providerRaw } : {}),
+      });
 
       // Surface any visible text the runtime didn't stream token-by-token.
       const turnText = result.content
@@ -3311,6 +3321,31 @@ export function createConsoleSession(config: ConsoleSessionConfig): ConsoleSessi
         .join("");
       if (turnText) assistantText += turnText;
       if (driven && turnText) callbacks?.onAssistantDelta?.(turnText);
+
+      if (result.stopReason === "max_tokens") {
+        const stopped = boundaryStop();
+        if (stopped) return stopped;
+        if (outputContinuations >= maxOutputContinuations) {
+          callbacks?.onNotice?.(
+            `Provider output limit reached repeatedly after ${maxOutputContinuations} automatic continuations. Progress is preserved; send another message to continue from this checkpoint.`,
+          );
+          return {
+            assistantText, toolCalls: runCalls, usage,
+            contextInputTokens: lastPlannerInputTokens > 0 ? lastPlannerInputTokens : undefined,
+            budget: budgetSnapshot(), stopReason: "max_output_tokens",
+          };
+        }
+        outputContinuations += 1;
+        callbacks?.onNotice?.(
+          `Provider output limit reached; continuing from the preserved checkpoint (${outputContinuations}/${maxOutputContinuations}).`,
+        );
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: "[AUTO-CONTINUATION] Continue exactly from the previous assistant checkpoint. Do not repeat completed work or re-run completed side effects. Preserve the existing plan and observations; emit any still-required tool calls normally." }],
+        });
+        continue;
+      }
+      outputContinuations = 0;
 
       const toolUseBlocks = result.content.filter(
         (b): b is Extract<NativeContentBlock, { type: "tool_use" }> => b.type === "tool_use",
