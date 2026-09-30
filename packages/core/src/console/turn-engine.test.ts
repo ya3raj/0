@@ -190,6 +190,34 @@ describe("createConsoleSession", () => {
     }
   });
 
+  it("automatically continues a max_tokens checkpoint and preserves partial progress", async () => {
+    const runtime = new ScriptedRuntime([
+      { content: [{ type: "text", text: "Part one. " }], stopReason: "max_tokens", durationMs: 1, usage: { inputTokens: 10, outputTokens: 8192 } },
+      { ...endTurn("Part two."), usage: { inputTokens: 12, outputTokens: 4 } },
+    ]);
+    const notices: string[] = [];
+    const session = createConsoleSession({ runtime, refineObjective: false, maxTurnTokens: 100_000 });
+    const outcome = await session.send("do the long task", { onNotice: message => notices.push(message) });
+    expect(outcome.stopReason).toBe("end_turn");
+    expect(outcome.assistantText).toBe("Part one. Part two.");
+    expect(outcome.usage).toEqual({ inputTokens: 22, outputTokens: 8196 });
+    expect(runtime.calls).toHaveLength(2);
+    expect(runtime.calls[1].messages).toContainEqual({ role: "assistant", content: [{ type: "text", text: "Part one. " }] });
+    expect(runtime.calls[1].messages.some(message => message.role === "user" && message.content.some(block => block.type === "text" && block.text.includes("[AUTO-CONTINUATION]")))).toBe(true);
+    expect(notices.some(message => message.includes("continuing from the preserved checkpoint"))).toBe(true);
+  });
+
+  it("bounds repeated max_tokens continuations and returns a resumable stop", async () => {
+    const capped = (): NativeRuntimeResult => ({ content: [{ type: "text", text: "checkpoint " }], stopReason: "max_tokens", durationMs: 1, usage: { inputTokens: 10, outputTokens: 8192 } });
+    const runtime = new ScriptedRuntime([capped(), capped(), capped(), capped()]);
+    const session = createConsoleSession({ runtime, refineObjective: false, maxTurnTokens: 200_000 });
+    const outcome = await session.send("keep going");
+    expect(outcome.stopReason).toBe("max_output_tokens");
+    expect(outcome.error).toBeUndefined();
+    expect(runtime.calls).toHaveLength(4);
+    expect(outcome.assistantText).toBe("checkpoint checkpoint checkpoint checkpoint ");
+  });
+
   it("stops with an error outcome when the runtime errors", async () => {
     const runtime = new ScriptedRuntime([
       { content: [], stopReason: "error", durationMs: 1, error: "boom" },

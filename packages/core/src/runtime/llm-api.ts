@@ -4865,6 +4865,10 @@ export class LlmApiRuntime implements Runtime, NativeRuntime {
     let completedResponse: Record<string, unknown> | null = null;
     let streamFailure: Record<string, string | null> | undefined;
     let responseUsage: NativeRuntimeResult["usage"];
+    // Visible response text is normally only forwarded as SSE deltas. Retain a
+    // copy so a provider output-cap boundary can become a resumable checkpoint
+    // without promoting potentially incomplete tool calls.
+    let streamedAssistantText = "";
     // The ChatGPT Codex backend's `response.completed` payload has NO
     // `output[]` array — it's just `{response: {id, usage, end_turn}}`.
     // Function calls + assistant messages flow exclusively through
@@ -5023,11 +5027,13 @@ export class LlmApiRuntime implements Runtime, NativeRuntime {
           type === "response.output_text.delta" ||
           (this.provider === "openrouter" && type === "response.content_part.delta")
         ) {
-          // Visible assistant text streaming. We don't accumulate locally —
-          // the agent loop's batcher is responsible for coalescing fragments
-          // before they hit the event bus. Just forward the raw fragment.
+          // Visible assistant text streaming. Keep a local copy as well as
+          // forwarding the raw fragment. The copy is used only when the provider
+          // ends with response.incomplete/max_output_tokens, so completed calls
+          // keep their existing final-output parsing behavior.
           const delta = typeof event.delta === "string" ? event.delta : "";
           if (delta) {
+            streamedAssistantText += delta;
             callbacks?.onDelta?.("assistant_response", delta);
           }
           continue;
@@ -5078,6 +5084,37 @@ export class LlmApiRuntime implements Runtime, NativeRuntime {
     }
 
     emitThinking(true);
+
+    // Hitting the provider's output ceiling is not a transport/runtime failure.
+    // Treat this one explicit incomplete reason as a resumable checkpoint while
+    // leaving every other response.incomplete/error/failed terminal event on the
+    // existing hard-failure path. In particular, streamed function calls are NOT
+    // promoted here: an incomplete turn may have an unfinished decision and
+    // replaying a side effect would be unsafe.
+    const outputLimitReached =
+      streamFailure?.event === "response.incomplete"
+      && streamFailure.status === "incomplete"
+      && streamFailure.reason === "max_output_tokens";
+    if (outputLimitReached) {
+      void reader.cancel().catch(() => { /* best-effort */ });
+      appendNativeTrace({
+        kind: "native-response-stream-max-tokens",
+        provider: this.providerLabel,
+        wireApi: this.wireApi,
+        httpStatus: res.status,
+        eventTypes: [...eventTypes],
+        receivedBytes,
+        malformedEvents,
+        trailingCharacters: buffer.length,
+        usage: responseUsage ?? null,
+      });
+      return {
+        content: [{ type: "text", text: streamedAssistantText }],
+        stopReason: "max_tokens",
+        durationMs: Date.now() - start,
+        ...(responseUsage ? { usage: responseUsage } : {}),
+      };
+    }
 
     if (!completedResponse || streamFailure) {
       if (streamFailure) {

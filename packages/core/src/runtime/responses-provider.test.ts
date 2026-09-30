@@ -314,9 +314,27 @@ describe("provider Responses selection", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+
+  it("maps max_output_tokens to a resumable checkpoint without promoting streamed tools", async () => {
+    process.env["ZERO_LLM_STREAM_MAX_ATTEMPTS"] = "3";
+    const events = [
+      { type: "response.output_text.delta", delta: "Completed observations. " },
+      { type: "response.output_text.delta", delta: "Continuing next." },
+      { type: "response.output_item.done", item: { type: "function_call", call_id: "unsafe_to_run", name: "inspect", arguments: "{}" } },
+      { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 7, output_tokens: 8192 } } },
+    ];
+    fetchMock.mockResolvedValueOnce(new Response(events.map(value => `data: ${JSON.stringify(value)}\n\n`).join("")));
+    const result = await request(codexConfig);
+    expect(result.stopReason).toBe("max_tokens");
+    expect(result.error).toBeUndefined();
+    expect(result.content).toEqual([{ type: "text", text: "Completed observations. Continuing next." }]);
+    expect(result.content.some(block => block.type === "tool_use")).toBe(false);
+    expect(result.usage).toEqual({ inputTokens: 7, outputTokens: 8192 });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { event: { type: "error", code: "rate_limit_exceeded" }, detail: "rate_limit_exceeded" },
-    { event: { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } }, detail: "max_output_tokens" },
     { event: { type: "response.completed", response: { status: "failed", error: { code: "server_error" } } }, detail: "server_error" },
   ])("does not turn Codex $detail into completion or transient EOF", async ({ event, detail }) => {
     process.env["ZERO_LLM_STREAM_MAX_ATTEMPTS"] = "3";
